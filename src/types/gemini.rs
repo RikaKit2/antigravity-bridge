@@ -24,6 +24,10 @@ pub struct GeminiRequest {
     pub contents: Vec<GeminiContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation_config: Option<GeminiGenerationConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<GeminiTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_config: Option<GeminiToolConfig>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -46,6 +50,47 @@ pub struct GeminiPart {
     pub thought: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thought_signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_call: Option<GeminiFunctionCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_response: Option<GeminiFunctionResponse>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiFunctionCall {
+    pub name: String,
+    pub args: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiFunctionResponse {
+    pub name: String,
+    pub response: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiTool {
+    pub function_declarations: Vec<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiToolConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_calling_config: Option<GeminiFunctionCallingConfig>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeminiFunctionCallingConfig {
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_function_names: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]

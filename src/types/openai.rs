@@ -11,6 +11,8 @@ pub struct ChatCompletionRequest {
     pub max_completion_tokens: Option<u32>,
     pub stop: Option<StopValue>,
     pub response_format: Option<ResponseFormat>,
+    pub tools: Option<Vec<Tool>>,
+    pub tool_choice: Option<serde_json::Value>,
     pub stream: Option<bool>,
 }
 
@@ -18,6 +20,9 @@ pub struct ChatCompletionRequest {
 pub struct ChatMessage {
     pub role: String,
     pub content: Option<MessageContent>,
+    pub tool_calls: Option<Vec<ToolCall>>,
+    pub tool_call_id: Option<String>,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -88,10 +93,39 @@ pub struct ChatChoice {
     pub finish_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tool {
+    pub r#type: String,
+    pub function: FunctionDefinition,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionDefinition {
+    pub name: String,
+    pub description: Option<String>,
+    pub parameters: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub r#type: String,
+    pub function: FunctionCallInstance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionCallInstance {
+    pub name: String,
+    pub arguments: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatResponseMessage {
     pub role: String,
-    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -95,10 +95,12 @@ async fn handle_chat_completions(
         let envelope = Adapter::build_chat_envelope(&payload, &wire_model, project_id.clone());
 
         match send_envelope_with_retry(&state, &config.server.upstream_url, &envelope).await {
-            Ok((raw_text, finish_reason, usage)) => {
+            Ok((raw_text, tool_calls, finish_reason, usage)) => {
                 info!(
-                    "Chat completion succeeded using model: {} (wire: {})",
-                    candidate_model, wire_model
+                    "Chat completion succeeded using model: {} (wire: {}) [tool_calls={}]",
+                    candidate_model,
+                    wire_model,
+                    tool_calls.len()
                 );
 
                 let is_json = payload
@@ -108,14 +110,23 @@ async fn handle_chat_completions(
                     == Some("json_object");
 
                 let content = if is_json {
-                    Adapter::clean_json_response(&raw_text)
+                    Some(Adapter::clean_json_response(&raw_text))
+                } else if raw_text.is_empty() && !tool_calls.is_empty() {
+                    None
                 } else {
-                    raw_text
+                    Some(raw_text)
+                };
+
+                let tcs_opt = if tool_calls.is_empty() {
+                    None
+                } else {
+                    Some(tool_calls)
                 };
 
                 let response = Adapter::build_chat_response(
                     candidate_model.clone(),
                     content,
+                    tcs_opt,
                     finish_reason,
                     usage.unwrap_or(UsageInfo {
                         prompt_tokens: 0,
@@ -171,7 +182,7 @@ async fn handle_fim_completions(
         Adapter::build_fim_envelope(&payload, default_model, project_id);
 
     match send_envelope_with_retry(&state, &config.server.upstream_url, &envelope).await {
-        Ok((raw_text, finish_reason, usage)) => {
+        Ok((raw_text, _, finish_reason, usage)) => {
             let response = Adapter::build_fim_response(
                 model,
                 raw_text,
@@ -203,7 +214,8 @@ async fn send_envelope_with_retry(
     state: &AppState,
     upstream_url: &str,
     envelope: &AntigravityEnvelope,
-) -> Result<(String, Option<String>, Option<UsageInfo>), (StatusCode, String, bool)> {
+) -> Result<(String, Vec<ToolCall>, Option<String>, Option<UsageInfo>), (StatusCode, String, bool)>
+{
     for attempt in 0..2 {
         let token = state.token_manager.get_token().await.map_err(|e| {
             (
@@ -270,9 +282,9 @@ async fn send_envelope_with_retry(
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
         let mut accumulated_text = String::new();
+        let mut accumulated_tool_calls = Vec::new();
         let mut last_finish_reason = None;
         let mut final_usage = None;
-
         while let Some(chunk_res) = stream.next().await {
             let chunk = match chunk_res {
                 Ok(c) => c,
@@ -299,8 +311,9 @@ async fn send_envelope_with_retry(
                     }
 
                     if let Ok(event) = serde_json::from_str::<GeminiSseEvent>(json_str) {
-                        let (text, finish_reason, usage) = Adapter::extract_chat_chunk(&event);
+                        let (text, tcs, finish_reason, usage) = Adapter::extract_chat_chunk(&event);
                         accumulated_text.push_str(&text);
+                        accumulated_tool_calls.extend(tcs);
                         if finish_reason.is_some() {
                             last_finish_reason = finish_reason;
                         }
@@ -312,7 +325,12 @@ async fn send_envelope_with_retry(
             }
         }
 
-        return Ok((accumulated_text, last_finish_reason, final_usage));
+        return Ok((
+            accumulated_text,
+            accumulated_tool_calls,
+            last_finish_reason,
+            final_usage,
+        ));
     }
 
     Err((

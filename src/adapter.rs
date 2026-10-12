@@ -11,7 +11,7 @@ impl Adapter {
         project_id: String,
     ) -> AntigravityEnvelope {
         let mut system_text = String::new();
-        let mut raw_turns: Vec<(String, String)> = Vec::new();
+        let mut raw_turns: Vec<(String, Vec<GeminiPart>)> = Vec::new();
 
         for msg in &req.messages {
             let content_text = msg
@@ -28,11 +28,61 @@ impl Adapter {
                     system_text.push_str(&content_text);
                 }
                 "assistant" => {
-                    raw_turns.push(("model".to_string(), content_text));
+                    let mut parts = Vec::new();
+                    if !content_text.is_empty() {
+                        parts.push(GeminiPart {
+                            text: Some(content_text),
+                            thought: None,
+                            thought_signature: None,
+                            function_call: None,
+                            function_response: None,
+                        });
+                    }
+                    if let Some(tool_calls) = &msg.tool_calls {
+                        for tc in tool_calls {
+                            let args_val = serde_json::from_str(&tc.function.arguments)
+                                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                            parts.push(GeminiPart {
+                                text: None,
+                                thought: None,
+                                thought_signature: None,
+                                function_call: Some(GeminiFunctionCall {
+                                    name: tc.function.name.clone(),
+                                    args: args_val,
+                                    id: Some(tc.id.clone()),
+                                }),
+                                function_response: None,
+                            });
+                        }
+                    }
+                    raw_turns.push(("model".to_string(), parts));
+                }
+                "tool" => {
+                    let fn_name = msg.name.clone().unwrap_or_else(|| "function".to_string());
+                    let resp_val = serde_json::from_str(&content_text)
+                        .unwrap_or_else(|_| serde_json::json!({ "output": content_text }));
+                    let part = GeminiPart {
+                        text: None,
+                        thought: None,
+                        thought_signature: None,
+                        function_call: None,
+                        function_response: Some(GeminiFunctionResponse {
+                            name: fn_name,
+                            response: resp_val,
+                        }),
+                    };
+                    raw_turns.push(("user".to_string(), vec![part]));
                 }
                 _ => {
                     // "user" and any custom roles
-                    raw_turns.push(("user".to_string(), content_text));
+                    let part = GeminiPart {
+                        text: Some(content_text),
+                        thought: None,
+                        thought_signature: None,
+                        function_call: None,
+                        function_response: None,
+                    };
+                    raw_turns.push(("user".to_string(), vec![part]));
                 }
             }
         }
@@ -43,6 +93,8 @@ impl Adapter {
                     text: Some(system_text),
                     thought: None,
                     thought_signature: None,
+                    function_call: None,
+                    function_response: None,
                 }],
             })
         } else {
@@ -51,25 +103,14 @@ impl Adapter {
 
         // Normalize roles: merge consecutive turns of the same role
         let mut contents: Vec<GeminiContent> = Vec::new();
-        for (role, text) in raw_turns {
+        for (role, parts) in raw_turns {
             if let Some(last) = contents.last_mut() {
                 if last.role == role {
-                    last.parts.push(GeminiPart {
-                        text: Some(text),
-                        thought: None,
-                        thought_signature: None,
-                    });
+                    last.parts.extend(parts);
                     continue;
                 }
             }
-            contents.push(GeminiContent {
-                role,
-                parts: vec![GeminiPart {
-                    text: Some(text),
-                    thought: None,
-                    thought_signature: None,
-                }],
-            });
+            contents.push(GeminiContent { role, parts });
         }
 
         // If contents is empty, ensure at least one empty user turn
@@ -80,6 +121,8 @@ impl Adapter {
                     text: Some("".to_string()),
                     thought: None,
                     thought_signature: None,
+                    function_call: None,
+                    function_response: None,
                 }],
             });
         }
@@ -103,10 +146,58 @@ impl Adapter {
             response_mime_type,
         });
 
+        let tools = req.tools.as_ref().map(|tool_list| {
+            let mut decls = Vec::new();
+            for t in tool_list {
+                let mut decl = serde_json::json!({
+                    "name": t.function.name,
+                });
+                if let Some(desc) = &t.function.description {
+                    decl["description"] = serde_json::json!(desc);
+                }
+                if let Some(params) = &t.function.parameters {
+                    decl["parameters"] = params.clone();
+                }
+                decls.push(decl);
+            }
+            vec![GeminiTool {
+                function_declarations: decls,
+            }]
+        });
+
+        let tool_config = req.tool_choice.as_ref().map(|tc| {
+            let (mode, allowed) = match tc {
+                serde_json::Value::String(s) if s == "auto" => ("AUTO".to_string(), None),
+                serde_json::Value::String(s) if s == "required" => ("ANY".to_string(), None),
+                serde_json::Value::String(s) if s == "none" => ("NONE".to_string(), None),
+                serde_json::Value::String(name) => ("ANY".to_string(), Some(vec![name.clone()])),
+                serde_json::Value::Object(obj) => {
+                    if let Some(f) = obj
+                        .get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                    {
+                        ("ANY".to_string(), Some(vec![f.to_string()]))
+                    } else {
+                        ("ANY".to_string(), None)
+                    }
+                }
+                _ => ("AUTO".to_string(), None),
+            };
+            GeminiToolConfig {
+                function_calling_config: Some(GeminiFunctionCallingConfig {
+                    mode,
+                    allowed_function_names: allowed,
+                }),
+            }
+        });
+
         let request = GeminiRequest {
             system_instruction,
             contents,
             generation_config,
+            tools,
+            tool_config,
         };
 
         AntigravityEnvelope {
@@ -138,8 +229,9 @@ impl Adapter {
     /// Parses SSE line and extracts non-thought text and usage metadata
     pub fn extract_chat_chunk(
         event: &GeminiSseEvent,
-    ) -> (String, Option<String>, Option<UsageInfo>) {
+    ) -> (String, Vec<ToolCall>, Option<String>, Option<UsageInfo>) {
         let mut text = String::new();
+        let mut tool_calls = Vec::new();
         let mut finish_reason = None;
         let mut usage = None;
 
@@ -157,6 +249,20 @@ impl Adapter {
                                 if let Some(t) = &part.text {
                                     text.push_str(t);
                                 }
+                                if let Some(fc) = &part.function_call {
+                                    let call_id = fc
+                                        .id
+                                        .clone()
+                                        .unwrap_or_else(|| format!("call_{}", uuid_simple()));
+                                    tool_calls.push(ToolCall {
+                                        id: call_id,
+                                        r#type: "function".to_string(),
+                                        function: FunctionCallInstance {
+                                            name: fc.name.clone(),
+                                            arguments: fc.args.to_string(),
+                                        },
+                                    });
+                                }
                             }
                         }
                     }
@@ -172,17 +278,23 @@ impl Adapter {
             }
         }
 
-        (text, finish_reason, usage)
+        (text, tool_calls, finish_reason, usage)
     }
 
     /// Builds a completed OpenAI ChatCompletionResponse
     pub fn build_chat_response(
         model: String,
-        content: String,
+        content: Option<String>,
+        tool_calls: Option<Vec<ToolCall>>,
         finish_reason: Option<String>,
         usage: UsageInfo,
     ) -> ChatCompletionResponse {
         let now = Utc::now().timestamp();
+        let final_finish_reason = if tool_calls.is_some() {
+            Some("tool_calls".to_string())
+        } else {
+            finish_reason.or(Some("stop".to_string()))
+        };
 
         ChatCompletionResponse {
             id: format!("chatcmpl-{}", uuid_simple()),
@@ -194,8 +306,9 @@ impl Adapter {
                 message: ChatResponseMessage {
                     role: "assistant".to_string(),
                     content,
+                    tool_calls,
                 },
-                finish_reason: finish_reason.or(Some("stop".to_string())),
+                finish_reason: final_finish_reason,
             }],
             usage,
         }
@@ -228,6 +341,8 @@ impl Adapter {
                         text: Some(prompt.to_string()),
                         thought: None,
                         thought_signature: None,
+                        function_call: None,
+                        function_response: None,
                     }],
                 }],
                 generation_config: Some(GeminiGenerationConfig {
@@ -236,6 +351,8 @@ impl Adapter {
                     stop_sequences,
                     response_mime_type: None,
                 }),
+                tools: None,
+                tool_config: None,
             },
             request_type: Some("agent".to_string()),
             request_id: Some(format!("agent-{}", uuid_simple())),
