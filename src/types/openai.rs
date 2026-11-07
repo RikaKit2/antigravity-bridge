@@ -192,3 +192,32 @@ pub struct CompletionChoice {
     pub logprobs: Option<()>,
     pub finish_reason: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatCompletionChunk {
+    pub id: String,
+    pub object: String,
+    pub created: i64,
+    pub model: String,
+    pub choices: Vec<ChatChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatChunkChoice {
+    pub index: usize,
+    pub delta: ChatChunkDelta,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ChatChunkDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+}

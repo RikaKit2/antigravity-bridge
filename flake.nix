@@ -14,7 +14,7 @@
       packages.${system} = {
         default = pkgs.stdenv.mkDerivation {
           pname = "antigravity-bridge";
-          version = "0.1.0";
+          version = "0.2.0";
           src = ./.;
 
           dontBuild = true;
@@ -36,7 +36,7 @@
 
         from-source = pkgs.rustPlatform.buildRustPackage {
           pname = "antigravity-bridge";
-          version = "0.1.0";
+          version = "0.2.0";
           src = ./.;
           cargoLock = {
             lockFile = ./Cargo.lock;

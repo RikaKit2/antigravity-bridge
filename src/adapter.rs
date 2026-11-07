@@ -314,6 +314,28 @@ impl Adapter {
         }
     }
 
+    pub fn build_chat_chunk(
+        id: &str,
+        created: i64,
+        model: &str,
+        delta: ChatChunkDelta,
+        finish_reason: Option<String>,
+        usage: Option<UsageInfo>,
+    ) -> ChatCompletionChunk {
+        ChatCompletionChunk {
+            id: id.to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created,
+            model: model.to_string(),
+            choices: vec![ChatChunkChoice {
+                index: 0,
+                delta,
+                finish_reason,
+            }],
+            usage,
+        }
+    }
+
     // --- Legacy FIM completion for Zed IDE ---
 
     pub fn build_fim_envelope(

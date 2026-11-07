@@ -5,15 +5,39 @@ use crate::types::*;
 use axum::{
     extract::State,
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, post},
     Json, Router,
 };
 use chrono::Utc;
+use futures_util::stream::Stream;
 use futures_util::StreamExt;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
+
+struct ReceiverStream<T> {
+    inner: tokio::sync::mpsc::Receiver<T>,
+}
+
+impl<T> ReceiverStream<T> {
+    fn new(inner: tokio::sync::mpsc::Receiver<T>) -> Self {
+        Self { inner }
+    }
+}
+
+impl<T> Stream for ReceiverStream<T> {
+    type Item = T;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.inner.poll_recv(cx)
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -76,6 +100,9 @@ async fn handle_chat_completions(
     State(state): State<AppState>,
     Json(payload): Json<ChatCompletionRequest>,
 ) -> Response {
+    if payload.stream == Some(true) {
+        return handle_chat_completions_stream(state, payload).await;
+    }
     let config = state.config.read().await.clone();
     let candidates = config.candidate_chain(payload.model.as_deref());
     let project_id = state.token_manager.get_project_id().await;
@@ -210,12 +237,187 @@ async fn handle_fim_completions(
 }
 
 /// Sends envelope to Antigravity upstream with 401 retry and streams response
-async fn send_envelope_with_retry(
+async fn handle_chat_completions_stream(
+    state: AppState,
+    payload: ChatCompletionRequest,
+) -> Response {
+    let config = state.config.read().await.clone();
+    let candidates = config.candidate_chain(payload.model.as_deref());
+    let project_id = state.token_manager.get_project_id().await;
+
+    let mut last_error = String::new();
+
+    for (idx, candidate_model) in candidates.iter().enumerate() {
+        let wire_model = config.resolve_model(candidate_model);
+        debug!(
+            "Attempting chat stream candidate {}/{}: {} (wire: {})",
+            idx + 1,
+            candidates.len(),
+            candidate_model,
+            wire_model
+        );
+
+        let envelope = Adapter::build_chat_envelope(&payload, &wire_model, project_id.clone());
+
+        match open_upstream_stream(&state, &config.server.upstream_url, &envelope).await {
+            Ok(response) => {
+                info!(
+                    "Chat stream succeeded using model: {} (wire: {})",
+                    candidate_model, wire_model
+                );
+
+                let candidate_name = candidate_model.clone();
+                let now = Utc::now().timestamp();
+                let chatcmpl_id =
+                    format!("chatcmpl-{}", Utc::now().timestamp_nanos_opt().unwrap_or(0));
+
+                let (tx, rx) =
+                    tokio::sync::mpsc::channel::<Result<Event, std::convert::Infallible>>(32);
+
+                tokio::spawn(async move {
+                    let mut stream = response.bytes_stream();
+                    let mut buffer = String::new();
+                    let mut sent_role = false;
+                    let mut last_finish_reason = None;
+                    let mut final_usage = None;
+
+                    while let Some(chunk_res) = stream.next().await {
+                        let chunk = match chunk_res {
+                            Ok(c) => c,
+                            Err(e) => {
+                                warn!("Error reading upstream stream chunk: {}", e);
+                                break;
+                            }
+                        };
+
+                        let chunk_str = String::from_utf8_lossy(&chunk);
+                        buffer.push_str(&chunk_str);
+
+                        while let Some(line_end) = buffer.find('\n') {
+                            let line = buffer[..line_end].trim().to_string();
+                            buffer.drain(..=line_end);
+
+                            if let Some(json_str) = line.strip_prefix("data:") {
+                                let json_str = json_str.trim();
+                                if json_str.is_empty() {
+                                    continue;
+                                }
+
+                                if let Ok(event) = serde_json::from_str::<GeminiSseEvent>(json_str)
+                                {
+                                    let (text, tcs, finish_reason, usage) =
+                                        Adapter::extract_chat_chunk(&event);
+
+                                    if finish_reason.is_some() {
+                                        last_finish_reason = finish_reason;
+                                    }
+                                    if usage.is_some() {
+                                        final_usage = usage;
+                                    }
+
+                                    if !text.is_empty() || !tcs.is_empty() {
+                                        let delta = ChatChunkDelta {
+                                            role: if !sent_role {
+                                                sent_role = true;
+                                                Some("assistant".to_string())
+                                            } else {
+                                                None
+                                            },
+                                            content: if text.is_empty() {
+                                                None
+                                            } else {
+                                                Some(text)
+                                            },
+                                            tool_calls: if tcs.is_empty() {
+                                                None
+                                            } else {
+                                                Some(tcs)
+                                            },
+                                        };
+
+                                        let chunk_obj = Adapter::build_chat_chunk(
+                                            &chatcmpl_id,
+                                            now,
+                                            &candidate_name,
+                                            delta,
+                                            None,
+                                            None,
+                                        );
+
+                                        if let Ok(json) = serde_json::to_string(&chunk_obj) {
+                                            if tx
+                                                .send(Ok(Event::default().data(json)))
+                                                .await
+                                                .is_err()
+                                            {
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    let finish = last_finish_reason.unwrap_or_else(|| "stop".to_string());
+                    let final_chunk = Adapter::build_chat_chunk(
+                        &chatcmpl_id,
+                        now,
+                        &candidate_name,
+                        ChatChunkDelta::default(),
+                        Some(finish),
+                        final_usage,
+                    );
+
+                    if let Ok(json) = serde_json::to_string(&final_chunk) {
+                        let _ = tx.send(Ok(Event::default().data(json))).await;
+                    }
+
+                    let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+                });
+
+                let sse_stream = ReceiverStream::new(rx);
+                return Sse::new(sse_stream)
+                    .keep_alive(KeepAlive::default())
+                    .into_response();
+            }
+            Err((status, err_msg, is_quota_or_capacity)) => {
+                warn!(
+                    "Model candidate '{}' failed with status {}: {}. Quota/capacity: {}",
+                    candidate_model, status, err_msg, is_quota_or_capacity
+                );
+                last_error = err_msg;
+
+                if idx + 1 < candidates.len() {
+                    info!(
+                        "Falling back from '{}' to '{}'",
+                        candidate_model,
+                        candidates[idx + 1]
+                    );
+                    continue;
+                }
+            }
+        }
+    }
+
+    error!("All candidate models exhausted: {}", last_error);
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(serde_json::json!({
+            "error": {
+                "message": format!("All model candidates failed: {}", last_error),
+                "type": "upstream_error"
+            }
+        })),
+    )
+        .into_response()
+}
+
+async fn open_upstream_stream(
     state: &AppState,
     upstream_url: &str,
     envelope: &AntigravityEnvelope,
-) -> Result<(String, Vec<ToolCall>, Option<String>, Option<UsageInfo>), (StatusCode, String, bool)>
-{
+) -> Result<reqwest::Response, (StatusCode, String, bool)> {
     for attempt in 0..2 {
         let token = state.token_manager.get_token().await.map_err(|e| {
             (
@@ -278,64 +480,74 @@ async fn send_envelope_with_retry(
             return Err((sc, err_body, is_quota_or_capacity));
         }
 
-        // Stream and accumulate SSE response
-        let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
-        let mut accumulated_text = String::new();
-        let mut accumulated_tool_calls = Vec::new();
-        let mut last_finish_reason = None;
-        let mut final_usage = None;
-        while let Some(chunk_res) = stream.next().await {
-            let chunk = match chunk_res {
-                Ok(c) => c,
-                Err(e) => {
-                    return Err((
-                        StatusCode::BAD_GATEWAY,
-                        format!("Error reading stream chunk: {}", e),
-                        false,
-                    ));
-                }
-            };
-
-            let chunk_str = String::from_utf8_lossy(&chunk);
-            buffer.push_str(&chunk_str);
-
-            while let Some(line_end) = buffer.find('\n') {
-                let line = buffer[..line_end].trim().to_string();
-                buffer.drain(..=line_end);
-
-                if let Some(json_str) = line.strip_prefix("data:") {
-                    let json_str = json_str.trim();
-                    if json_str.is_empty() {
-                        continue;
-                    }
-
-                    if let Ok(event) = serde_json::from_str::<GeminiSseEvent>(json_str) {
-                        let (text, tcs, finish_reason, usage) = Adapter::extract_chat_chunk(&event);
-                        accumulated_text.push_str(&text);
-                        accumulated_tool_calls.extend(tcs);
-                        if finish_reason.is_some() {
-                            last_finish_reason = finish_reason;
-                        }
-                        if usage.is_some() {
-                            final_usage = usage;
-                        }
-                    }
-                }
-            }
-        }
-
-        return Ok((
-            accumulated_text,
-            accumulated_tool_calls,
-            last_finish_reason,
-            final_usage,
-        ));
+        return Ok(response);
     }
 
     Err((
         StatusCode::BAD_GATEWAY,
         "Failed after retry".to_string(),
         false,
+    ))
+}
+
+async fn send_envelope_with_retry(
+    state: &AppState,
+    upstream_url: &str,
+    envelope: &AntigravityEnvelope,
+) -> Result<(String, Vec<ToolCall>, Option<String>, Option<UsageInfo>), (StatusCode, String, bool)>
+{
+    let response = open_upstream_stream(state, upstream_url, envelope).await?;
+
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+    let mut accumulated_text = String::new();
+    let mut accumulated_tool_calls = Vec::new();
+    let mut last_finish_reason = None;
+    let mut final_usage = None;
+    while let Some(chunk_res) = stream.next().await {
+        let chunk = match chunk_res {
+            Ok(c) => c,
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_GATEWAY,
+                    format!("Error reading stream chunk: {}", e),
+                    false,
+                ));
+            }
+        };
+
+        let chunk_str = String::from_utf8_lossy(&chunk);
+        buffer.push_str(&chunk_str);
+
+        while let Some(line_end) = buffer.find('\n') {
+            let line = buffer[..line_end].trim().to_string();
+            buffer.drain(..=line_end);
+
+            if let Some(json_str) = line.strip_prefix("data:") {
+                let json_str = json_str.trim();
+                if json_str.is_empty() {
+                    continue;
+                }
+
+                if let Ok(event) = serde_json::from_str::<GeminiSseEvent>(json_str) {
+                    let (text, tcs, finish_reason, usage) = Adapter::extract_chat_chunk(&event);
+                    accumulated_text.push_str(&text);
+                    accumulated_tool_calls.extend(tcs);
+                    if finish_reason.is_some() {
+                        last_finish_reason = finish_reason;
+                    }
+                    if usage.is_some() {
+                        final_usage = usage;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((
+        accumulated_text,
+        accumulated_tool_calls,
+        last_finish_reason,
+        final_usage,
     ))
 }
