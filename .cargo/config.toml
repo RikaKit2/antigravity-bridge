@@ -8,7 +8,7 @@ rustflags = ["-C", "target-cpu=native"]
 linker = "clang"
 rustflags = [
     "-C", "target-cpu=native",
-    "-C", "link-arg=--ld-path=wild",
+    "-C", "link-arg=-fuse-ld=mold",
     "-Zshare-generics=y",
     "-Zcodegen-backend=cranelift",
 ]

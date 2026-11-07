@@ -32,10 +32,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Install mold linker (Linux)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends mold clang
+          mold --version
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         with:
-          components: clippy, rustfmt
+          components: clippy, rustfmt, rustc-codegen-cranelift
 
       - uses: Swatinem/rust-cache@v2
 
@@ -61,8 +67,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Install mold linker (Linux)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends mold clang
+          mold --version
+
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustc-codegen-cranelift
 
       - uses: Swatinem/rust-cache@v2
 
